@@ -63,10 +63,10 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
     }
 
   }
-
+  
   def query(searchTerm: String): Source[Question, Unit] = {
-    val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
-    Source(publisher).map(_.as[Question])
+		  val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
+				  Source(publisher).map(_.as[Question])
   }
 
 }
@@ -117,5 +117,6 @@ object AkkaHttpMicroservice extends App with Service with ElasticSearchStreaming
     case e => e.printStackTrace()
   }
 
+  
   Http().bindAndHandle(routes, config.getString("http.interface"), config.getInt("http.port"))
 }

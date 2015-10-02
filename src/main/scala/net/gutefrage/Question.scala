@@ -9,10 +9,13 @@ object Questions {
 
   implicit object QuestionHitAs extends HitAs[Question] {
     override def as(hit: RichSearchHit): Question = {
-      Question(hit.sourceAsMap("id").asInstanceOf[Int])
+      Question(
+        hit.sourceAsMap("qid").asInstanceOf[Int],
+        hit.sourceAsMap("title").toString,
+        hit.sourceAsMap("body").toString)
     }
   }
 }
 
-case class Question(id: Int) 
+case class Question(id: Int, title: String, body: String) 
 
