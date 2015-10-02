@@ -3,6 +3,7 @@ package net.gutefrage
 import akka.actor.ActorSystem
 import akka.event.{ LoggingAdapter, Logging }
 import akka.http.scaladsl.Http
+import akka.stream.scaladsl.FlattenStrategy
 import akka.http.scaladsl.client.RequestBuilding
 import akka.http.scaladsl.marshalling.ToResponseMarshallable
 import akka.http.scaladsl.model.{ HttpResponse, HttpRequest }
@@ -32,9 +33,36 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
 
   import com.sksamuel.elastic4s.ElasticDsl._
   import com.sksamuel.elastic4s.streams.ReactiveElastic._
+  import com.sksamuel.elastic4s.mappings.FieldType._
   import Questions._
 
   val QUESTION_INDEX = "questions"
+  val LIVE = "live"
+
+  
+  def createIndex(): Future[Boolean] = {
+
+    val indexExists = elasticsearch.execute {
+      index exists QUESTION_INDEX
+    }
+
+    indexExists flatMap { response =>
+      if (!response.isExists) {
+       elasticsearch.execute {
+          create index QUESTION_INDEX mappings (
+            LIVE as (
+              "qid" typed IntegerType,
+              "title" typed StringType,
+              "body" typed StringType
+            )
+          )
+        }.map(_.isAcknowledged)
+      } else {
+        Future.successful(true)
+      }
+    }
+
+  }
 
   def query(searchTerm: String): Source[Question, Unit] = {
     val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
@@ -49,16 +77,22 @@ trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
   val logger: LoggingAdapter
 
   val queryWebsocket = Flow[Message].collect {
-    case tm: TextMessage => ""
+    case tm: TextMessage =>
+      val questionStream = tm.textStream
+        .map(query)
+        // flatten the Source of Sources in a single Source
+        .flatten(FlattenStrategy.concat)
+        // json stuff happens here later
+        .map(_.toString)
+      //TextMessage(questionStream)
+      TextMessage(questionStream)
   }
 
   val routes = {
     logRequestResult("akka-http-microservice") {
       pathPrefix("es") {
-        (get & path(Segment)) { ip =>
-          complete {
-            OK
-          }
+        path("get") {
+          handleWebsocketMessages(queryWebsocket)
         }
       }
     }
@@ -72,7 +106,16 @@ object AkkaHttpMicroservice extends App with Service with ElasticSearchStreaming
 
   override val config = ConfigFactory.load()
   override val logger = Logging(system, getClass)
-  override val elasticsearch = ElasticClient.local
+  override val elasticsearch = ElasticClient.remote("localhost", 9300)
+  
+  val create = createIndex()
+  create.onSuccess {
+    case true => println("Index created")
+    case false => println("Index hasn't been acknowledged")
+  }
+  create.onFailure {
+    case e => e.printStackTrace()
+  }
 
   Http().bindAndHandle(routes, config.getString("http.interface"), config.getInt("http.port"))
 }
