@@ -4,6 +4,8 @@ import akka.actor.ActorSystem
 import akka.event.{ LoggingAdapter, Logging }
 import akka.http.scaladsl.Http
 import akka.stream.scaladsl._
+import akka.stream.OverflowStrategy
+import akka.stream.UniformFanInShape
 import akka.http.scaladsl.client.RequestBuilding
 import akka.http.scaladsl.marshalling.ToResponseMarshallable
 import akka.http.scaladsl.model.{ HttpResponse, HttpRequest }
@@ -18,7 +20,6 @@ import com.typesafe.config.ConfigFactory
 import scala.collection.immutable.Seq
 import scala.concurrent.{ ExecutionContextExecutor, Future }
 import com.sksamuel.elastic4s.ElasticClient
-import akka.stream.OverflowStrategy
 
 trait ActorSystemComponent {
   implicit val system: ActorSystem
@@ -36,10 +37,21 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
   import com.sksamuel.elastic4s.ElasticDsl._
   import com.sksamuel.elastic4s.streams.ReactiveElastic._
   import com.sksamuel.elastic4s.mappings.FieldType._
+  import com.sksamuel.elastic4s.streams.RequestBuilder
+  import com.sksamuel.elastic4s.BulkCompatibleDefinition
   import Questions._
 
   val QUESTION_INDEX = "questions"
   val LIVE = "live"
+
+  implicit val builder = new RequestBuilder[Question] {
+    // the request returned doesn't have to be an index - it can be anything supported by the bulk api
+    def request(q: Question): BulkCompatibleDefinition = index into QUESTION_INDEX / LIVE fields (
+      "qid" -> q.id,
+      "title" -> q.title,
+      "body" -> q.body
+    )
+  }
 
   def createIndex(): Future[Boolean] = {
 
@@ -70,12 +82,42 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
     Source(publisher).map(_.as[Question])
   }
 
+  def insert: Sink[Question, Unit] = {
+    val subscriber = elasticsearch.subscriber[Question](
+      batchSize = 1,
+      concurrentRequests = 1
+    )
+    Sink(subscriber)
+  }
+
 }
 
 trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
 
   def config: Config
   val logger: LoggingAdapter
+
+  val insertWebsocket = Flow[Message].collect {
+    case tm: TextMessage =>
+      val elasticInsert = Flow() { implicit b =>
+        import FlowGraph.Implicits._
+
+        val broadcast = b.add(Broadcast[Question](2))
+        broadcast.out(0) ~> insert
+
+        // expose ports
+        (broadcast.in, broadcast.out(1))
+      }
+
+      val stream = tm.textStream.map { questionStr =>
+        val Array(id, title, body) = questionStr.split(";")
+        Question(id.toInt, title, body)
+      }.via(elasticInsert).map { q =>
+        s"Inserted $q"
+      }
+
+      TextMessage(stream)
+  }
 
   val queryWebsocket = Flow[Message].collect {
     case tm: TextMessage =>
@@ -95,16 +137,21 @@ trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
 
       val commandTriggeredFlow = Flow() { implicit b =>
         import FlowGraph.Implicits._
+        // broadcast the command to the elasticsearch source and the tick system
         val bcast = b.add(Broadcast[Command](2))
         val zip = b.add(Zip[Command, Seq[Question]]())
 
+        // forward the ticks
         bcast.out(0) ~> zip.in0
+
+        // filter out the Next commands
         bcast.out(1)
           .filter(_.isInstanceOf[Search])
           .map {
             case Search(term) => query(term)
           }
-          .flatten(FlattenStrategy.concat).grouped(2) ~> zip.in1
+          .flatten(FlattenStrategy.concat)
+          .grouped(2) ~> zip.in1
 
         (bcast.in, zip.out)
       }
@@ -122,6 +169,9 @@ trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
         } ~
           path("get") {
             handleWebsocketMessages(queryWebsocket)
+          } ~
+          path("insert") {
+            handleWebsocketMessages(insertWebsocket)
           }
       }
     }
