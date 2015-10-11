@@ -2,19 +2,16 @@ package net.gutefrage
 
 import akka.actor.ActorSystem
 import akka.event.{ LoggingAdapter, Logging }
-import akka.http.scaladsl.Http
+import akka.stream._
 import akka.stream.scaladsl._
-import akka.stream.OverflowStrategy
-import akka.stream.UniformFanInShape
+import akka.http.scaladsl.Http
 import akka.http.scaladsl.client.RequestBuilding
 import akka.http.scaladsl.marshalling.ToResponseMarshallable
 import akka.http.scaladsl.model.{ HttpResponse, HttpRequest }
 import akka.http.scaladsl.model.StatusCodes._
 import akka.http.scaladsl.server.Directives._
 import akka.http.scaladsl.unmarshalling.Unmarshal
-import akka.http.scaladsl.model.ws.{ Message, TextMessage }
-import akka.stream.{ ActorMaterializer, Materializer }
-import akka.stream.scaladsl.{ Flow, Sink, Source }
+import akka.http.scaladsl.model.ws._
 import com.typesafe.config.Config
 import com.typesafe.config.ConfigFactory
 import scala.collection.immutable.Seq
@@ -27,145 +24,117 @@ trait ActorSystemComponent {
   implicit val materializer: Materializer
 }
 
-/**
- * Shows the streaming part
- */
-trait ElasticSearchStreaming { self: ActorSystemComponent =>
-
-  val elasticsearch: ElasticClient
-
-  import com.sksamuel.elastic4s.ElasticDsl._
-  import com.sksamuel.elastic4s.streams.ReactiveElastic._
-  import com.sksamuel.elastic4s.mappings.FieldType._
-  import com.sksamuel.elastic4s.streams.RequestBuilder
-  import com.sksamuel.elastic4s.BulkCompatibleDefinition
-  import Questions._
-
-  val QUESTION_INDEX = "questions"
-  val LIVE = "live"
-
-  implicit val builder = new RequestBuilder[Question] {
-    // the request returned doesn't have to be an index - it can be anything supported by the bulk api
-    def request(q: Question): BulkCompatibleDefinition = index into QUESTION_INDEX / LIVE fields (
-      "qid" -> q.id,
-      "title" -> q.title,
-      "body" -> q.body
-    )
-  }
-
-  def createIndex(): Future[Boolean] = {
-
-    val indexExists = elasticsearch.execute {
-      index exists QUESTION_INDEX
-    }
-
-    indexExists flatMap { response =>
-      if (!response.isExists) {
-        elasticsearch.execute {
-          create index QUESTION_INDEX mappings (
-            LIVE as (
-              "qid" typed IntegerType,
-              "title" typed StringType,
-              "body" typed StringType
-            )
-          )
-        }.map(_.isAcknowledged)
-      } else {
-        Future.successful(true)
-      }
-    }
-
-  }
-
-  def query(searchTerm: String): Source[Question, Unit] = {
-    val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
-    Source(publisher).map(_.as[Question])
-  }
-
-  def insert: Sink[Question, Unit] = {
-    val subscriber = elasticsearch.subscriber[Question](
-      batchSize = 1,
-      concurrentRequests = 1
-    )
-    Sink(subscriber)
-  }
-
-}
-
 trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
 
   def config: Config
   val logger: LoggingAdapter
 
-  val insertWebsocket = Flow[Message].collect {
-    case tm: TextMessage =>
-      val elasticInsert = Flow() { implicit b =>
-        import FlowGraph.Implicits._
+  // ---------------------------------------------------- 
+  // ----------- Inserting ------------------------------ 
+  // ---------------------------------------------------- 
 
-        val broadcast = b.add(Broadcast[Question](2))
-        broadcast.out(0) ~> insert
+  /**
+   * Creates a second sink with the elasticsubscriber and broadcasts
+   * to this sink and a second ouput for the flow
+   *
+   * {{{
+   *                   /  ----------------->  out
+   * in -> broadcast ->
+   *                   \ ->   elastic subscriber ]
+   * }}}
+   */
+  def elasticInsert(): Flow[Question, Question, Unit] = Flow() { implicit b =>
+    import FlowGraph.Implicits._
 
-        // expose ports
-        (broadcast.in, broadcast.out(1))
-      }
+    val broadcast = b.add(Broadcast[Question](2))
+    broadcast.out(0) ~> insert
 
-      val stream = tm.textStream.map { questionStr =>
-        val Array(id, title, body) = questionStr.split(";")
-        Question(id.toInt, title, body)
-      }.via(elasticInsert).map { q =>
-        s"Inserted $q"
-      }
-
-      TextMessage(stream)
+    // expose ports
+    (broadcast.in, broadcast.out(1))
   }
 
-  val queryWebsocket = Flow[Message].collect {
-    case tm: TextMessage =>
-      val questionStream = tm.textStream
-        .map(query)
-        // flatten the Source of Sources in a single Source
-        .flatten(FlattenStrategy.concat)
-        // json stuff happens here later
-        .map(_.toString)
-
-      //TextMessage(questionStream)
-      TextMessage(questionStream)
+  /**
+   * Maps the stream of messages to questions that get inserted into elasticsearch
+   *
+   * {{{
+   *                               / -> TextMessage(question)
+   * Message -> String -> Question
+   *                               \ -> elasticsearch subscriber
+   * }}}
+   */
+  def insertWebsocket(): Flow[Message, Message, Unit] = Flow[Message].collect {
+    case tm: TextMessage => tm.textStream
+  }.mapAsync(1) { stream =>
+    stream.runFold("")(_ ++ _)
+  }.map { questionStr =>
+    // Parsing is a bit rough
+    val Array(id, title, body) = questionStr.split(";")
+    Question(id.toInt, title, body)
+  }.via(elasticInsert()).map { q =>
+    TextMessage(s"Inserted $q")
   }
 
-  val queryScrollingWebsocket = Flow[Message].collect {
-    case tm: TextMessage =>
+  // ---------------------------------------------------- 
+  // ----------- Query (no scrolling) ------------------- 
+  // ---------------------------------------------------- 
 
-      val commandTriggeredFlow = Flow() { implicit b =>
-        import FlowGraph.Implicits._
-        // broadcast the command to the elasticsearch source and the tick system
-        val bcast = b.add(Broadcast[Command](2))
-        val zip = b.add(Zip[Command, Seq[Question]]())
+  /**
+   * Outputs each element in one message
+   */
+  def queryWebsocket() = Flow[Message].collect {
+    case tm: TextMessage => tm.textStream
+  }.mapAsync(1) { stream =>
+    stream.runFold("")(_ ++ _)
+  }.map(query)
+    // flatten the Source of Sources in a single Source
+    .flatten(FlattenStrategy.concat)
+    // json stuff happens here later
+    .map(q => TextMessage(q.toString))
 
-        // forward the ticks
-        bcast.out(0) ~> zip.in0
+  // ---------------------------------------------------- 
+  // ---------- Scrolling results ----------------------- 
+  // ---------------------------------------------------- 
 
-        // filter out the Next commands
-        bcast.out(1)
-          .filter(_.isInstanceOf[Search])
-          .map {
-            case Search(term) => query(term)
-          }
-          .flatten(FlattenStrategy.concat)
-          .grouped(2) ~> zip.in1
+  def scrollingWebsocket = Flow[Message].collect {
+    case tm: TextMessage => tm.textStream
+  }.mapAsync(1) { stream =>
+    stream.runFold("")(_ ++ _)
+  }.map(Commands.parse)
+    .via(commandTriggeredFlow)
+    .map(q => TextMessage(q.toString))
 
-        (bcast.in, zip.out)
-      }
+  def commandTriggeredFlow: Flow[Command, Question, Unit] = Flow() { implicit b =>
+    import FlowGraph.Implicits._
 
-      val questionStream = tm.textStream.map(Commands.parse).via(commandTriggeredFlow.map(_.toString))
+    // routes the questions to different output streams
+    val route = b.add(new CommandRoute[Question])
 
-      TextMessage(questionStream)
+    // search commands create new output streams (without canceling the old)
+    val questions = route.searchCommands.map {
+      case Search(term) => query(term)
+    }.flatten(FlattenStrategy.concat)
+
+    // zip next commands and questions together
+    val zip = b.add(ZipWith((msg: Question, trigger: Command) => msg))
+
+    questions ~> zip.in0
+    route.nextCommands.mapConcat {
+      case Next(num) => (0 until num).map(_ => Next(1))
+    } ~> zip.in1
+
+    (route.in, zip.out)
   }
+
+  // ---------------------------------------------------- 
+  // ----------------- Routes --------------------------- 
+  // ---------------------------------------------------- 
 
   val routes = {
-    logRequestResult("akka-http-microservice") {
+
+    logRequestResult("akka-http-elasticsearch") {
       pathPrefix("es") {
         path("scroll") {
-          handleWebsocketMessages(queryScrollingWebsocket)
+          handleWebsocketMessages(scrollingWebsocket)
         } ~
           path("get") {
             handleWebsocketMessages(queryWebsocket)
@@ -179,7 +148,7 @@ trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
 }
 
 object AkkaHttpMicroservice extends App with Service with ElasticSearchStreaming with ActorSystemComponent {
-  override implicit val system = ActorSystem()
+  override implicit val system = ActorSystem("elastic-streams")
   override implicit val executor = system.dispatcher
   override implicit val materializer = ActorMaterializer()
 
