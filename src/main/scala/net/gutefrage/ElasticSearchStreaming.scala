@@ -14,7 +14,8 @@ import com.sksamuel.elastic4s.streams.ReactiveElastic._
 import com.sksamuel.elastic4s.mappings.FieldType._
 import com.sksamuel.elastic4s.streams.RequestBuilder
 import com.sksamuel.elastic4s.BulkCompatibleDefinition
-import Questions._
+import model.Question
+import model.Questions._
 
 /**
  * Shows the streaming part
@@ -23,47 +24,38 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
 
   val elasticsearch: ElasticClient
 
-  val QUESTION_INDEX = "questions"
-  val LIVE = "live"
 
-  implicit val builder = new RequestBuilder[Question] {
-    // the request returned doesn't have to be an index - it can be anything supported by the bulk api
-    def request(q: Question): BulkCompatibleDefinition = index into QUESTION_INDEX / LIVE fields (
-      "qid" -> q.id,
-      "title" -> q.title,
-      "body" -> q.body
-    )
+  /**
+   * Creates the index if not existing
+   * @return true if index exists and is acknowledged
+   */
+  def createIndex(): Future[Boolean] = elasticsearch.execute {
+    index exists QUESTION_INDEX
+  }.flatMap {
+    case response if response.isExists() => Future.successful(true)
+    case response => elasticsearch.execute {
+      create index QUESTION_INDEX mappings (
+        QUESTION_INDEX_TYPE as (
+          "qid" typed IntegerType,
+          "title" typed StringType,
+          "body" typed StringType
+        )
+      )
+    }.map(_.isAcknowledged)
   }
 
-  def createIndex(): Future[Boolean] = {
-
-    val indexExists = elasticsearch.execute {
-      index exists QUESTION_INDEX
-    }
-
-    indexExists flatMap { response =>
-      if (!response.isExists) {
-        elasticsearch.execute {
-          create index QUESTION_INDEX mappings (
-            LIVE as (
-              "qid" typed IntegerType,
-              "title" typed StringType,
-              "body" typed StringType
-            )
-          )
-        }.map(_.isAcknowledged)
-      } else {
-        Future.successful(true)
-      }
-    }
-
-  }
-
+  /**
+   * @param searchTerm to search for in the index
+   * @return Source of question objects
+   */
   def query(searchTerm: String): Source[Question, Unit] = {
     val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
     Source(publisher).map(_.as[Question])
   }
 
+  /**
+   * @return a sink to write questions to
+   */
   def insert: Sink[Question, Unit] = {
     val subscriber = elasticsearch.subscriber[Question](
       batchSize = 1,
@@ -71,6 +63,5 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
     )
     Sink(subscriber)
   }
-
 
 }

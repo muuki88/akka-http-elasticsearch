@@ -1,4 +1,4 @@
-package net.gutefrage
+package net.gutefrage.model
 
 import scala.util.Try
 

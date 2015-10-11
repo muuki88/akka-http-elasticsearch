@@ -17,17 +17,37 @@ import com.typesafe.config.ConfigFactory
 import scala.collection.immutable.Seq
 import scala.concurrent.{ ExecutionContextExecutor, Future }
 import com.sksamuel.elastic4s.ElasticClient
+import net.gutefrage.model._
 
-trait ActorSystemComponent {
-  implicit val system: ActorSystem
-  implicit def executor: ExecutionContextExecutor
-  implicit val materializer: Materializer
-}
+trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
 
-trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
+  // dependencies
 
   def config: Config
   val logger: LoggingAdapter
+
+  // ---------------------------------------------------- 
+  // ----------------- Routes --------------------------- 
+  // ---------------------------------------------------- 
+
+  // format: OFF 
+  val routes = {
+    //
+    logRequestResult("akka-http-elasticsearch") {
+      pathPrefix("es") {
+        path("scroll") {
+          handleWebsocketMessages(scrollingWebsocket)
+        } ~
+        path("get") {
+          handleWebsocketMessages(queryWebsocket)
+        } ~
+        path("insert") {
+          handleWebsocketMessages(insertWebsocket)
+        }
+      }
+    }
+  }
+  // format: ON 
 
   // ---------------------------------------------------- 
   // ----------- Inserting ------------------------------ 
@@ -125,45 +145,5 @@ trait Service { self: ActorSystemComponent with ElasticSearchStreaming =>
     (route.in, zip.out)
   }
 
-  // ---------------------------------------------------- 
-  // ----------------- Routes --------------------------- 
-  // ---------------------------------------------------- 
-
-  val routes = {
-
-    logRequestResult("akka-http-elasticsearch") {
-      pathPrefix("es") {
-        path("scroll") {
-          handleWebsocketMessages(scrollingWebsocket)
-        } ~
-          path("get") {
-            handleWebsocketMessages(queryWebsocket)
-          } ~
-          path("insert") {
-            handleWebsocketMessages(insertWebsocket)
-          }
-      }
-    }
-  }
 }
 
-object AkkaHttpMicroservice extends App with Service with ElasticSearchStreaming with ActorSystemComponent {
-  override implicit val system = ActorSystem("elastic-streams")
-  override implicit val executor = system.dispatcher
-  override implicit val materializer = ActorMaterializer()
-
-  override val config = ConfigFactory.load()
-  override val logger = Logging(system, getClass)
-  override val elasticsearch = ElasticClient.remote("localhost", 9300)
-
-  val create = createIndex()
-  create.onSuccess {
-    case true => println("Index created")
-    case false => println("Index hasn't been acknowledged")
-  }
-  create.onFailure {
-    case e => e.printStackTrace()
-  }
-
-  Http().bindAndHandle(routes, config.getString("http.interface"), config.getInt("http.port"))
-}

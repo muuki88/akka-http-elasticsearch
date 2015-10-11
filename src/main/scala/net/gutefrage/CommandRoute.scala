@@ -3,6 +3,9 @@ package net.gutefrage
 import akka.stream._
 import akka.stream.FanOutShape._
 import akka.stream.scaladsl.FlexiRoute
+import net.gutefrage.model.Search
+import net.gutefrage.model.Next
+import net.gutefrage.model.Command
 
 /**
  * @see http://doc.akka.io/docs/akka-stream-and-http-experimental/1.0/scala/stream-customize.html#Using_FlexiRoute
