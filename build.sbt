@@ -28,3 +28,9 @@ libraryDependencies ++= {
 }
 
 Revolver.settings
+
+// docker settings
+maintainer in Docker := "Nepomuk Seiler"
+version in Docker    := "latest"
+dockerExposedPorts   := List(9000)
+dockerBaseImage      := "lwieske/java-8:jre-8u60"
