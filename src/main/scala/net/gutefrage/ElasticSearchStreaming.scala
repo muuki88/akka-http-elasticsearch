@@ -24,7 +24,6 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
 
   val elasticsearch: ElasticClient
 
-
   /**
    * Creates the index if not existing
    * @return true if index exists and is acknowledged
@@ -57,7 +56,11 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
    * @return a sink to write questions to
    */
   def insert: Sink[Question, Unit] = {
-    ???
+    val subscriber = elasticsearch.subscriber[Question](
+      batchSize = 1,
+      concurrentRequests = 1
+    )
+    Sink(subscriber)
   }
 
 }

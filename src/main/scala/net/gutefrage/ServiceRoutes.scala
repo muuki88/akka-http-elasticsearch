@@ -55,7 +55,15 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
    *                   \ ~>   elastic subscriber ]
    * }}}
    */
-  def elasticInsert(): Flow[Question, Question, Unit] = ???
+  def elasticInsert(): Flow[Question, Question, Unit] = Flow() { implicit b =>
+    import FlowGraph.Implicits._
+
+    val broadcast = b.add(Broadcast[Question](2))
+    broadcast.out(0) ~> insert
+
+    // expose ports
+    (broadcast.in, broadcast.out(1))
+  }
 
   /**
    * {{{
@@ -78,7 +86,17 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
    *                               \ ~> elasticsearch subscriber
    * }}}
    */
-  def insertWebsocket(): Flow[Message, Message, Unit] = ???
+  def insertWebsocket(): Flow[Message, Message, Unit] = Flow[Message].collect {
+    case tm: TextMessage => tm.textStream
+  }.mapAsync(1) { stream =>
+    stream.runFold("")(_ ++ _)
+  }.map { questionStr =>
+    // Parsing is a bit rough
+    val Array(id, title, body) = questionStr.split(";")
+    Question(id.toInt, title, body)
+  }.via(elasticInsert()).map { q =>
+    TextMessage(s"Inserted $q")
+  }
 
   // ---------------------------------------------------- 
   // ----------- Query (no scrolling) ------------------- 
