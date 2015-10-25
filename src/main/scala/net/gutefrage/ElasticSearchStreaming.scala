@@ -49,7 +49,8 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
    * @return Source of question objects
    */
   def query(searchTerm: String): Source[Question, Unit] = {
-    ???
+    val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
+    Source(publisher).map(_.as[Question])
   }
 
   /**

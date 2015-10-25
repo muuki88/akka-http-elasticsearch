@@ -59,12 +59,12 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
 
   /**
    * {{{
-   * 
-   * 
-   *                                        / filter(success) ~> elastiInsert() ~> successMessage \ 
+   *
+   *
+   *                                        / filter(success) ~> elastiInsert() ~> successMessage \
    * in ~> parse: Try[Question] ~> bcast ~>                                                          ~> merge: Message ~> out
    *                                        \ filter(failure) ~> errorMessage                     /
-   * 
+   *
    * }}}
    */
   def elasticPersitFlow(): Flow[String, Message, Unit] = ???
@@ -87,7 +87,15 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
   /**
    * Outputs each element in one message
    */
-  def queryWebsocket() = ???
+  def queryWebsocket() = Flow[Message].collect {
+    case tm: TextMessage => tm.textStream
+  }.mapAsync(1) { stream =>
+    stream.runFold("")(_ ++ _)
+  }.map(query)
+    // flatten the Source of Sources in a single Source
+    .flatten(FlattenStrategy.concat)
+    // json stuff happens here later
+    .map(q => TextMessage(q.toString))
 
   // ---------------------------------------------------- 
   // ---------- Scrolling results ----------------------- 
