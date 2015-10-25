@@ -75,7 +75,37 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
    *
    * }}}
    */
-  def elasticPersitFlow(): Flow[String, Message, Unit] = ???
+  def elasticPersitFlow(): Flow[String, Message, Unit] = {
+    // Flow parsing the question string into a question object
+    val parseFlow = Flow[String].map { questionStr =>
+      Try {
+        require(questionStr.split(";").length == 3, "Input must have 3 fields: <id:Int>;<title:String>;<body:String>")
+        val Array(id, title, body) = questionStr.split(";")
+        Question(id.toInt, title, body)
+      } recoverWith {
+        case NonFatal(e) => Failure(new IllegalArgumentException(s"Error parsing input $questionStr:\n${e.getClass.getSimpleName}: ${e.getMessage}", e))
+      }
+    }
+
+    // flows mapping results to a valid message
+    val successMessage = Flow[Question].map(q => TextMessage(s"Inserted: $q"))
+    val errorMessage = Flow[Throwable].map(e => TextMessage(e.getMessage))
+
+    // final persist flow. 
+    val persistFlow = Flow() { implicit b =>
+      import FlowGraph.Implicits._
+
+      val bcast = b.add(Broadcast[Try[Question]](2))
+      val merge = b.add(Merge[TextMessage](2))
+
+      bcast.out(0).filter(_.isSuccess).map(_.get) ~> elasticInsert() ~> successMessage ~> merge
+      bcast.out(1).filter(_.isFailure).map(_.failed.get) ~> errorMessage ~> merge
+
+      (bcast.in, merge.out)
+    }
+
+    parseFlow.via(persistFlow)
+  }
 
   /**
    * Maps the stream of messages to questions that get inserted into elasticsearch
@@ -90,13 +120,7 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
     case tm: TextMessage => tm.textStream
   }.mapAsync(1) { stream =>
     stream.runFold("")(_ ++ _)
-  }.map { questionStr =>
-    // Parsing is a bit rough
-    val Array(id, title, body) = questionStr.split(";")
-    Question(id.toInt, title, body)
-  }.via(elasticInsert()).map { q =>
-    TextMessage(s"Inserted $q")
-  }
+  }.via(elasticPersitFlow)
 
   // ---------------------------------------------------- 
   // ----------- Query (no scrolling) ------------------- 
