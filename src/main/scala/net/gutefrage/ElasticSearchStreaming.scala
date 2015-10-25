@@ -49,19 +49,14 @@ trait ElasticSearchStreaming { self: ActorSystemComponent =>
    * @return Source of question objects
    */
   def query(searchTerm: String): Source[Question, Unit] = {
-    val publisher = elasticsearch.publisher(search in QUESTION_INDEX query searchTerm scroll "1m")
-    Source(publisher).map(_.as[Question])
+    ???
   }
 
   /**
    * @return a sink to write questions to
    */
   def insert: Sink[Question, Unit] = {
-    val subscriber = elasticsearch.subscriber[Question](
-      batchSize = 1,
-      concurrentRequests = 1
-    )
-    Sink(subscriber)
+    ???
   }
 
 }

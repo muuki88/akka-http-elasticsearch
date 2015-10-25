@@ -55,15 +55,7 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
    *                   \ ~>   elastic subscriber ]
    * }}}
    */
-  def elasticInsert(): Flow[Question, Question, Unit] = Flow() { implicit b =>
-    import FlowGraph.Implicits._
-
-    val broadcast = b.add(Broadcast[Question](2))
-    broadcast.out(0) ~> insert
-
-    // expose ports
-    (broadcast.in, broadcast.out(1))
-  }
+  def elasticInsert(): Flow[Question, Question, Unit] = ???
 
   /**
    * {{{
@@ -75,37 +67,7 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
    * 
    * }}}
    */
-  def elasticPersitFlow(): Flow[String, Message, Unit] = {
-    // Flow parsing the question string into a question object
-    val parseFlow = Flow[String].map { questionStr =>
-      Try {
-        require(questionStr.split(";").length == 3, "Input must have 3 fields: <id:Int>;<title:String>;<body:String>")
-        val Array(id, title, body) = questionStr.split(";")
-        Question(id.toInt, title, body)
-      } recoverWith {
-        case NonFatal(e) => Failure(new IllegalArgumentException(s"Error parsing input $questionStr:\n${e.getClass.getSimpleName}: ${e.getMessage}", e))
-      }
-    }
-
-    // flows mapping results to a valid message
-    val successMessage = Flow[Question].map(q => TextMessage(s"Inserted: $q"))
-    val errorMessage = Flow[Throwable].map(e => TextMessage(e.getMessage))
-
-    // final persist flow. 
-    val persistFlow = Flow() { implicit b =>
-      import FlowGraph.Implicits._
-
-      val bcast = b.add(Broadcast[Try[Question]](2))
-      val merge = b.add(Merge[TextMessage](2))
-
-      bcast.out(0).filter(_.isSuccess).map(_.get) ~> elasticInsert() ~> successMessage ~> merge
-      bcast.out(1).filter(_.isFailure).map(_.failed.get) ~> errorMessage ~> merge
-
-      (bcast.in, merge.out)
-    }
-
-    parseFlow.via(persistFlow)
-  }
+  def elasticPersitFlow(): Flow[String, Message, Unit] = ???
 
   /**
    * Maps the stream of messages to questions that get inserted into elasticsearch
@@ -116,11 +78,7 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
    *                               \ ~> elasticsearch subscriber
    * }}}
    */
-  def insertWebsocket(): Flow[Message, Message, Unit] = Flow[Message].collect {
-    case tm: TextMessage => tm.textStream
-  }.mapAsync(1) { stream =>
-    stream.runFold("")(_ ++ _)
-  }.via(elasticPersitFlow)
+  def insertWebsocket(): Flow[Message, Message, Unit] = ???
 
   // ---------------------------------------------------- 
   // ----------- Query (no scrolling) ------------------- 
@@ -129,49 +87,13 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
   /**
    * Outputs each element in one message
    */
-  def queryWebsocket() = Flow[Message].collect {
-    case tm: TextMessage => tm.textStream
-  }.mapAsync(1) { stream =>
-    stream.runFold("")(_ ++ _)
-  }.map(query)
-    // flatten the Source of Sources in a single Source
-    .flatten(FlattenStrategy.concat)
-    // json stuff happens here later
-    .map(q => TextMessage(q.toString))
+  def queryWebsocket() = ???
 
   // ---------------------------------------------------- 
   // ---------- Scrolling results ----------------------- 
   // ---------------------------------------------------- 
 
-  def scrollingWebsocket = Flow[Message].collect {
-    case tm: TextMessage => tm.textStream
-  }.mapAsync(1) { stream =>
-    stream.runFold("")(_ ++ _)
-  }.map(Commands.parse)
-    .via(commandTriggeredFlow)
-    .map(q => TextMessage(q.toString))
-
-  def commandTriggeredFlow: Flow[Command, Question, Unit] = Flow() { implicit b =>
-    import FlowGraph.Implicits._
-
-    // routes the questions to different output streams
-    val route = b.add(new CommandRoute[Question])
-
-    // search commands create new output streams (without canceling the old)
-    val questions = route.searchCommands.map {
-      case Search(term) => query(term)
-    }.flatten(FlattenStrategy.concat)
-
-    // zip next commands and questions together
-    val zip = b.add(ZipWith((msg: Question, trigger: Command) => msg))
-
-    questions ~> zip.in0
-    route.nextCommands.mapConcat {
-      case Next(num) => (0 until num).map(_ => Next(1))
-    } ~> zip.in1
-
-    (route.in, zip.out)
-  }
+  def scrollingWebsocket = ???
 
 }
 
