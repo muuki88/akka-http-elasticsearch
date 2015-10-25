@@ -143,7 +143,35 @@ trait ServiceRoutes { self: ActorSystemComponent with ElasticSearchStreaming =>
   // ---------- Scrolling results ----------------------- 
   // ---------------------------------------------------- 
 
-  def scrollingWebsocket = ???
+  def scrollingWebsocket = Flow[Message].collect {
+    case tm: TextMessage => tm.textStream
+  }.mapAsync(1) { stream =>
+    stream.runFold("")(_ ++ _)
+  }.map(Commands.parse)
+    .via(commandTriggeredFlow)
+    .map(q => TextMessage(q.toString))
+
+  def commandTriggeredFlow: Flow[Command, Question, Unit] = Flow() { implicit b =>
+    import FlowGraph.Implicits._
+
+    // routes the questions to different output streams
+    val route = b.add(new CommandRoute[Question])
+
+    // search commands create new output streams (without canceling the old)
+    val questions = route.searchCommands.map {
+      case Search(term) => query(term)
+    }.flatten(FlattenStrategy.concat)
+
+    // zip next commands and questions together
+    val zip = b.add(ZipWith((msg: Question, trigger: Command) => msg))
+
+    questions ~> zip.in0
+    route.nextCommands.mapConcat {
+      case Next(num) => (0 until num).map(_ => Next(1))
+    } ~> zip.in1
+
+    (route.in, zip.out)
+  }
 
 }
 
